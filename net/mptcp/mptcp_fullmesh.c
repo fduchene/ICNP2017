@@ -62,6 +62,8 @@ struct fullmesh_priv {
 	struct work_struct subflow_work;
 	/* Delayed worker, when the routing-tables are not yet ready. */
 	struct delayed_work subflow_retry_work;
+	/* Address tha can't be used to join */
+	union inet_addr banned_addr;
 
 	/* Remote addresses */
 	struct fullmesh_rem4 remaddr4[MPTCP_MAX_ADDR];
@@ -72,6 +74,12 @@ struct fullmesh_priv {
 	u16 remove_addrs; /* Addresses to remove */
 	u8 announced_addrs_v4; /* IPv4 Addresses we did announce */
 	u8 announced_addrs_v6; /* IPv6 Addresses we did announce */
+
+	u8 unacked_addrs_v4; /* IPv4 Addresses we did announce but not acked yet */
+	u8 unacked_addrs_v6; /* IPv6 Addresses we did announce but not acked yet */
+
+	u8 toack_raddrs_v4; /* IPv4 Addresses we need to ACK the ADD_ADDR */
+	u8 toack_raddrs_v6; /* IPv6 Addresses we need to ACK the ADD_ADDR */
 
 	u8	add_addr; /* Are we sending an add_addr? */
 
@@ -189,6 +197,12 @@ static void mptcp_addv4_raddr(struct mptcp_cb *mpcb,
 	mpcb->list_rcvd = 1;
 	fmp->rem4_bits |= (1 << i);
 
+	/* IF the addr has been learnt from a ADD_ADDR */
+	if (id > 0) {
+		mpcb->ack_raddr_signal = 1;
+		fmp->toack_raddrs_v4 |= (1 << i);
+	}
+
 	return;
 }
 
@@ -243,6 +257,9 @@ static void mptcp_addv6_raddr(struct mptcp_cb *mpcb,
 	rem6->rem6_id = id;
 	mpcb->list_rcvd = 1;
 	fmp->rem6_bits |= (1 << i);
+
+	mpcb->ack_raddr_signal = 1;
+	fmp->toack_raddrs_v6 |= (1 << i);
 
 	return;
 }
@@ -498,20 +515,24 @@ next_subflow:
 	if (mpcb->master_sk &&
 	    !tcp_sk(mpcb->master_sk)->mptcp->fully_established)
 		goto exit;
-
+	
 	mptcp_for_each_bit_set(fmp->rem4_bits, i) {
 		struct fullmesh_rem4 *rem;
 		u8 remaining_bits;
 
 		rem = &fmp->remaddr4[i];
 		remaining_bits = ~(rem->bitfield) & mptcp_local->loc4_bits;
-
+		
 		/* Are there still combinations to handle? */
 		if (remaining_bits) {
 			int i = mptcp_find_free_index(~remaining_bits);
 			struct mptcp_rem4 rem4;
 
 			rem->bitfield |= (1 << i);
+		
+			/* If the address is banned, skip to the next one */
+			if (rem->addr.s_addr == fmp->banned_addr.in.s_addr)
+				goto next_subflow;
 
 			rem4.addr = rem->addr;
 			rem4.port = rem->port;
@@ -1537,7 +1558,145 @@ static int full_mesh_get_local_id(sa_family_t family, union inet_addr *addr,
 
 	return id;
 }
+static void full_mesh_ack_raddr_signal(struct sock *sk, unsigned *size,
+				  struct tcp_out_options *opts,
+				  struct sk_buff *skb)
+{
+	const struct tcp_sock *tp = tcp_sk(sk);
+	struct mptcp_cb *mpcb = tp->mpcb;
+	//struct sock *meta_sk = mpcb->meta_sk;
+	struct fullmesh_priv *fmp = fullmesh_get_priv(mpcb);
+	struct fullmesh_rem4 *rem4;
+	int i;
 
+	mptcp_debug("%s we received a signal telling us that we must ACK some ADD_ADDR\n", __func__);	
+
+	mpcb->ack_raddr_signal = 0;
+
+	if (fmp->toack_raddrs_v4) {
+		mptcp_for_each_bit_set(fmp->toack_raddrs_v4, i) {
+			if ((mpcb->mptcp_ver == MPTCP_VERSION_0 &&
+				MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_ADD_ADDR4_ALIGN) ||
+				(mpcb->mptcp_ver >= MPTCP_VERSION_1 &&
+				MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_ADD_ADDR4_ALIGN_VER1)) {
+
+				rem4 = &fmp->remaddr4[i];
+
+				mptcp_debug("%s: we wust ack the ADD_ADDR for IP :%pI4 with id %d index %d\n", __func__, &rem4->addr.s_addr, rem4->rem4_id, i);
+
+				opts->options |= OPTION_MPTCP;
+				opts->mptcp_options |= OPTION_ADD_ADDR;
+				opts->add_addr4.addr_id = rem4->rem4_id;
+				opts->add_addr4.addr = rem4->addr;
+				opts->add_addr_v4 = 1;
+				opts->add_addr_echo = 1;
+				
+
+				if (mpcb->mptcp_ver >= MPTCP_VERSION_1) {
+					u8 mptcp_hash_mac[20];
+					u8 no_key[8];
+
+					*(u64 *)no_key = 0;
+					mptcp_hmac_sha1((u8 *)&mpcb->mptcp_loc_key,
+							(u8 *)no_key,
+							(u32 *)mptcp_hash_mac, 2,
+							1, (u8 *)&rem4->rem4_id,
+							4, (u8 *)&opts->add_addr4.addr.s_addr);
+					opts->add_addr4.trunc_mac = *(u64 *)mptcp_hash_mac;
+				}
+
+				if (skb) {
+					fmp->toack_raddrs_v4 &= (0 << i);
+					//fmp->add_addr--;
+				}
+
+				if (mpcb->mptcp_ver < MPTCP_VERSION_1)
+					*size += MPTCP_SUB_LEN_ADD_ADDR4_ALIGN;
+				if (mpcb->mptcp_ver >= MPTCP_VERSION_1)
+					*size += MPTCP_SUB_LEN_ADD_ADDR4_ALIGN_VER1;
+			}
+		}
+	}
+
+	mpcb->ack_raddr_signal = !!(fmp->toack_raddrs_v4 || fmp->toack_raddrs_v6);
+}
+
+static void full_mesh_add_addr_ack_recv(struct sock *sk,
+				const union inet_addr *addr,
+				sa_family_t family, __be16 port, u8 id)
+{
+	const struct tcp_sock *tp = tcp_sk(sk);
+	struct mptcp_cb *mpcb = tp->mpcb;
+	struct sock *meta_sk = mpcb->meta_sk;
+	struct fullmesh_priv *fmp = fullmesh_get_priv(mpcb);
+	struct mptcp_loc_addr *mptcp_local;
+	struct mptcp_fm_ns *fm_ns = fm_get_ns(sock_net(sk));
+	int i;
+
+	rcu_read_lock();
+	mptcp_local = rcu_dereference(fm_ns->local);
+
+	mptcp_for_each_bit_set(fmp->unacked_addrs_v4, i) {
+		if (id == mptcp_local->locaddr4[i].loc4_id) {
+			//if (memcmp(&mptcp_local->locaddr4[i].addr.s_addr, &addr->in, sizeof(addr)) != 0) {
+			/*if (mptcp_local->locaddr4[i].addr != addr->in) {
+				mptcp_debug("%s: MEH, les addresses de l'ACK ne matchent pas %pI4 ET %pI4!\n", __func__, &mptcp_local->locaddr4[i].addr.s_addr, &addr->in);
+				goto unlock_and_exit;
+			}*/
+			mptcp_debug("%s: YEAH ca match!\n", __func__);
+			fmp->unacked_addrs_v4 &= (0 << i);
+
+		}
+	}
+
+unlock_and_exit:
+	mptcp_debug("%s: On sort de la fonction de vérification de l'echo avec %x comme valeur.\n", __func__, fmp->unacked_addrs_v4);
+	mpcb->addr_retrans_signal = !!(fmp->unacked_addrs_v4);
+	rcu_read_unlock();
+}
+static void full_mesh_rentrans_addr(struct sock *sk, unsigned *size,
+				  struct tcp_out_options *opts,
+				  struct sk_buff *skb)
+{
+
+	const struct tcp_sock *tp = tcp_sk(sk);
+	struct mptcp_cb *mpcb = tp->mpcb;
+	struct sock *meta_sk = mpcb->meta_sk;
+	struct fullmesh_priv *fmp = fullmesh_get_priv(mpcb);
+	struct mptcp_loc_addr *mptcp_local;
+	struct mptcp_fm_ns *fm_ns = fm_get_ns(sock_net(sk));
+	int i;
+	mpcb->addr_retrans_signal = 0;
+
+	rcu_read_lock();
+	mptcp_local = rcu_dereference(fm_ns->local);
+
+
+	mptcp_for_each_bit_set(fmp->unacked_addrs_v4, i) {
+
+		if((mpcb->mptcp_ver == MPTCP_VERSION_0 &&
+		      MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_ADD_ADDR4_ALIGN) ||
+		      (mpcb->mptcp_ver >= MPTCP_VERSION_1 &&
+		      MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_ADD_ADDR4_ALIGN_VER1)) {
+			mptcp_debug("%s: We didn't get an ACK for the ADDRID %d, retransmitting!\n", __func__, mptcp_local->locaddr4[i].loc4_id);
+			opts->options |= OPTION_MPTCP;
+			opts->mptcp_options |= OPTION_ADD_ADDR;
+			opts->add_addr4.addr_id = mptcp_local->locaddr4[i].loc4_id;
+			opts->add_addr4.addr = mptcp_local->locaddr4[i].addr;
+			opts->add_addr_v4 = 1;
+			opts->add_addr_echo = 0;
+
+			if (mpcb->mptcp_ver < MPTCP_VERSION_1)
+				*size += MPTCP_SUB_LEN_ADD_ADDR4_ALIGN;
+			if (mpcb->mptcp_ver >= MPTCP_VERSION_1)
+				*size += MPTCP_SUB_LEN_ADD_ADDR4_ALIGN_VER1;
+		}
+	}
+
+	rcu_read_unlock();
+
+	mpcb->addr_retrans_signal = !!(fmp->unacked_addrs_v4);
+}
 static void full_mesh_addr_signal(struct sock *sk, unsigned *size,
 				  struct tcp_out_options *opts,
 				  struct sk_buff *skb)
@@ -1577,6 +1736,7 @@ static void full_mesh_addr_signal(struct sock *sk, unsigned *size,
 		opts->add_addr4.addr_id = mptcp_local->locaddr4[ind].loc4_id;
 		opts->add_addr4.addr = mptcp_local->locaddr4[ind].addr;
 		opts->add_addr_v4 = 1;
+		opts->add_addr_echo = 0;
 		if (mpcb->mptcp_ver >= MPTCP_VERSION_1) {
 			u8 mptcp_hash_mac[20];
 			u8 no_key[8];
@@ -1592,6 +1752,7 @@ static void full_mesh_addr_signal(struct sock *sk, unsigned *size,
 
 		if (skb) {
 			fmp->announced_addrs_v4 |= (1 << ind);
+			fmp->unacked_addrs_v4 |= (1 << ind);
 			fmp->add_addr--;
 		}
 
@@ -1620,6 +1781,7 @@ skip_ipv4:
 		opts->add_addr6.addr_id = mptcp_local->locaddr6[ind].loc6_id;
 		opts->add_addr6.addr = mptcp_local->locaddr6[ind].addr;
 		opts->add_addr_v6 = 1;
+		opts->add_addr_echo = 0;
 		if (mpcb->mptcp_ver >= MPTCP_VERSION_1) {
 			u8 mptcp_hash_mac[20];
 			u8 no_key[8];
@@ -1635,6 +1797,7 @@ skip_ipv4:
 
 		if (skb) {
 			fmp->announced_addrs_v6 |= (1 << ind);
+			fmp->unacked_addrs_v6 |= (1 << ind);
 			fmp->add_addr--;
 		}
 		if (mpcb->mptcp_ver < MPTCP_VERSION_1)
@@ -1666,6 +1829,7 @@ remove_addr:
 
 exit:
 	mpcb->addr_signal = !!(fmp->add_addr || fmp->remove_addrs);
+	mpcb->addr_retrans_signal = !!(fmp->unacked_addrs_v4);
 }
 
 static void full_mesh_rem_raddr(struct mptcp_cb *mpcb, u8 rem_id)
@@ -1794,6 +1958,13 @@ static struct pernet_operations full_mesh_net_ops = {
 	.exit = mptcp_fm_exit_net,
 };
 
+void full_mesh_ban_raddr(struct sock *sk, sa_family_t family, const union inet_addr *addr){
+	struct fullmesh_priv *fmp = fullmesh_get_priv(tcp_sk(sk)->mpcb);
+	mptcp_debug("%s: ban received for the IPv4 addr %pI4\n", __func__ , addr);
+	fmp->banned_addr = *addr;
+
+}
+
 static struct mptcp_pm_ops full_mesh __read_mostly = {
 	.new_session = full_mesh_new_session,
 	.release_sock = full_mesh_release_sock,
@@ -1803,6 +1974,10 @@ static struct mptcp_pm_ops full_mesh __read_mostly = {
 	.addr_signal = full_mesh_addr_signal,
 	.add_raddr = full_mesh_add_raddr,
 	.rem_raddr = full_mesh_rem_raddr,
+	.ban_raddr = full_mesh_ban_raddr,
+	.retransmit_add_raddr = full_mesh_rentrans_addr,
+	.ack_raddr_signal = full_mesh_ack_raddr_signal,
+	.add_addr_ack_recv = full_mesh_add_addr_ack_recv,
 	.name = "fullmesh",
 	.owner = THIS_MODULE,
 };

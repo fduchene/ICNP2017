@@ -904,6 +904,7 @@ void mptcp_synack_options(struct request_sock *req,
 		opts->mptcp_ver = mtreq->mptcp_ver;
 		opts->mp_capable.sender_key = mtreq->mptcp_loc_key;
 		opts->dss_csum = !!sysctl_mptcp_checksum || mtreq->dss_csum;
+		opts->no_join = 1;
 		*remaining -= MPTCP_SUB_LEN_CAPABLE_SYN_ALIGN;
 	} else {
 		opts->mptcp_options |= OPTION_MP_JOIN | OPTION_TYPE_SYNACK;
@@ -1000,6 +1001,11 @@ void mptcp_established_options(struct sock *sk, struct sk_buff *skb,
 			return;
 	}
 
+	/* If we need to send some ACKS for received ADD_ADDR */
+	if (unlikely(mpcb->ack_raddr_signal) && mpcb->pm_ops->ack_raddr_signal) {
+		mpcb->pm_ops->ack_raddr_signal(sk, size, opts, skb);
+	}
+
 	if (!tp->mptcp->include_mpc && !tp->mptcp->pre_established) {
 		opts->options |= OPTION_MPTCP;
 		opts->mptcp_options |= OPTION_DATA_ACK;
@@ -1017,6 +1023,10 @@ void mptcp_established_options(struct sock *sk, struct sk_buff *skb,
 		}
 
 		*size += MPTCP_SUB_LEN_DSS_ALIGN;
+	}
+
+	if (unlikely(mpcb->addr_retrans_signal) && mpcb->pm_ops->retransmit_add_raddr) {
+		mpcb->pm_ops->retransmit_add_raddr(sk, size, opts, skb);
 	}
 
 	if (unlikely(mpcb->addr_signal) && mpcb->pm_ops->addr_signal &&
@@ -1070,6 +1080,12 @@ void mptcp_options_write(__be32 *ptr, struct tcp_sock *tp,
 			ptr += MPTCP_SUB_LEN_CAPABLE_ACK_ALIGN >> 2;
 		}
 
+		if (OPTION_TYPE_SYNACK & opts->mptcp_options) {
+			mpc->c = 1;
+		} else {
+			mpc->c = 0;
+		}
+
 		mpc->sub = MPTCP_SUB_CAPABLE;
 		mpc->a = opts->dss_csum;
 		mpc->b = 0;
@@ -1112,6 +1128,7 @@ void mptcp_options_write(__be32 *ptr, struct tcp_sock *tp,
 		mpadd->kind = TCPOPT_MPTCP;
 		if (opts->add_addr_v4) {
 			mpadd->sub = MPTCP_SUB_ADD_ADDR;
+			mpadd->echo = opts->add_addr_echo;
 			mpadd->ipver = 4;
 			mpadd->addr_id = opts->add_addr4.addr_id;
 			mpadd->u.v4.addr = opts->add_addr4.addr;
@@ -1126,6 +1143,7 @@ void mptcp_options_write(__be32 *ptr, struct tcp_sock *tp,
 			}
 		} else if (opts->add_addr_v6) {
 			mpadd->sub = MPTCP_SUB_ADD_ADDR;
+			mpadd->echo = opts->add_addr_echo;
 			mpadd->ipver = 6;
 			mpadd->addr_id = opts->add_addr6.addr_id;
 			memcpy(&mpadd->u.v6.addr, &opts->add_addr6.addr,

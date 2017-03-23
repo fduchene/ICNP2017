@@ -62,6 +62,7 @@ struct mptcp_loc4 {
 
 struct mptcp_rem4 {
 	u8		rem4_id;
+	u8		nojoin;
 	__be16		port;
 	struct in_addr	addr;
 };
@@ -75,6 +76,7 @@ struct mptcp_loc6 {
 
 struct mptcp_rem6 {
 	u8		rem6_id;
+	u8		nojoin;
 	__be16		port;
 	struct in6_addr	addr;
 };
@@ -135,7 +137,8 @@ struct mptcp_options_received {
 		more_rem_addr:1, /* Saw one more rem-addr. */
 
 		mp_fail:1,
-		mp_fclose:1;
+		mp_fclose:1,
+		saw_nojoin:1;
 	u8	rem_id;		/* Address-id in the MP_JOIN */
 	u8	prio_addr_id;	/* Address-id in the MP_PRIO */
 
@@ -239,6 +242,14 @@ struct mptcp_pm_ops {
 	void (*rem_raddr)(struct mptcp_cb *mpcb, u8 rem_id);
 	void (*init_subsocket_v4)(struct sock *sk, struct in_addr addr);
 	void (*init_subsocket_v6)(struct sock *sk, struct in6_addr addr);
+	void (*ban_raddr)(struct sock *sk, sa_family_t family, const union inet_addr *addr);
+	void (*ack_raddr_signal)(struct sock *sk, unsigned *size,
+				struct tcp_out_options *opts, struct sk_buff *skb);
+	void (*add_addr_ack_recv)(struct sock *sk,
+				const union inet_addr *addr, sa_family_t family,
+				__be16 port, u8 id);
+	void (*retransmit_add_raddr)(struct sock *sk, unsigned *size,
+	struct tcp_out_options *opts, struct sk_buff *skb);
 
 	char		name[MPTCP_PM_NAME_MAX];
 	struct module	*owner;
@@ -276,6 +287,8 @@ struct mptcp_cb {
 		in_time_wait:1,
 		list_rcvd:1, /* XXX TO REMOVE */
 		addr_signal:1, /* Path-manager wants us to call addr_signal */
+		ack_raddr_signal:1, /* We need to ACK some ADD_ADDR */
+		addr_retrans_signal:1, /* We need to retransmit some ADD_ADDR */
 		dss_csum:1,
 		server_side:1,
 		infinite_mapping_rcv:1,
@@ -483,7 +496,8 @@ struct mp_capable {
 	__u8	ver:4,
 		sub:4;
 	__u8	h:1,
-		rsv:5,
+		rsv:4,
+		c:1,
 		b:1,
 		a:1;
 #elif defined(__BIG_ENDIAN_BITFIELD)
@@ -491,7 +505,8 @@ struct mp_capable {
 		ver:4;
 	__u8	a:1,
 		b:1,
-		rsv:5,
+		c:1,
+		rsv:4,
 		h:1;
 #else
 #error	"Adjust your <asm/byteorder.h> defines"
@@ -560,11 +575,13 @@ struct mp_add_addr {
 	__u8	kind;
 	__u8	len;
 #if defined(__LITTLE_ENDIAN_BITFIELD)
-	__u8	ipver:4,
+	__u8	ipver:3,
+		echo:1,
 		sub:4;
 #elif defined(__BIG_ENDIAN_BITFIELD)
 	__u8	sub:4,
-		ipver:4;
+		echo:1,
+		ipver:3;
 #else
 #error	"Adjust your <asm/byteorder.h> defines"
 #endif
@@ -1105,6 +1122,7 @@ static inline void mptcp_init_mp_opt(struct mptcp_options_received *mopt)
 	mopt->saw_mpc = 0;
 	mopt->dss_csum = 0;
 	mopt->drop_me = 0;
+	mopt->saw_nojoin = 0;
 
 	mopt->is_mp_join = 0;
 	mopt->join_ack = 0;

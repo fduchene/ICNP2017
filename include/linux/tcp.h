@@ -84,8 +84,10 @@ struct tcp_out_options {
 #ifdef CONFIG_MPTCP
 	u16	mptcp_options;	/* bit field of MPTCP related OPTION_* */
 	u8	dss_csum:1,	/* dss-checksum required? */
+		no_join:1,	/* don't join this iface */
 		add_addr_v4:1,
 		add_addr_v6:1,
+		add_addr_echo:1,
 		mptcp_ver:4;
 
 	union {

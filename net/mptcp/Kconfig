@@ -23,6 +23,12 @@ config MPTCP_FULLMESH
 	---help---
 	  This path-management module will create a full-mesh among all IP-addresses.
 
+config MPTCP_LOADBALANCING
+	tristate "MPTCP Load-Balancing Path-Manager"
+	depends on MPTCP=y
+	---help---
+	  This path-management module will allow MPTCP to work with unmodified Load Balancers.
+
 config MPTCP_NDIFFPORTS
 	tristate "MPTCP ndiff-ports"
 	depends on MPTCP=y
@@ -47,6 +53,9 @@ choice
 
 	config DEFAULT_FULLMESH
 		bool "Full mesh" if MPTCP_FULLMESH=y
+
+	config DEFAULT_LOADBALANCING
+		bool "load balancing" if MPTCP_LOADBALANCING=y
 
 	config DEFAULT_NDIFFPORTS
 		bool "ndiff-ports" if MPTCP_NDIFFPORTS=y

@@ -1659,6 +1659,21 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 			mopt->drop_me = 1;
 			break;
 		}
+		if (mpcapable->c) {
+			/*const struct iphdr *iph;
+			if (skb)
+				iph = ip_hdr(skb);
+			
+			if (skb && tp && is_master_tp(tp) &&  
+				tp->mpcb->pm_ops->ban_raddr) {
+				//tp->mpcb->pm_ops->push_info(sk, MPTCP_OPEN_BUP, tp⁻>inet_conn);
+				mptcp_debug("%s: ban from skb src_addr:%pI4 dst_addr:%pI4\n", __func__ , &iph->saddr, &iph->daddr);
+
+			}*/
+			mopt->saw_nojoin = 1;
+			mptcp_debug("%s: mp_capable: NO JOIN option received\n",
+				    __func__);
+		}
 
 		/* MPTCP-RFC 6824:
 		 * "An implementation that only supports this method MUST set
@@ -2002,8 +2017,12 @@ skip_hmac_v6:
 		return;
 	}
 
-	if (mpcb->pm_ops->add_raddr)
+	if (mpcb->pm_ops->add_raddr && !mpadd->echo) {
 		mpcb->pm_ops->add_raddr(mpcb, &addr, family, port, mpadd->addr_id);
+	} else if (mpcb->pm_ops->add_addr_ack_recv && mpadd->echo) {
+		mpcb->pm_ops->add_addr_ack_recv(sk, &addr, family, port, mpadd->addr_id);
+		return;
+	}
 
 	MPTCP_INC_STATS_BH(sock_net(sk), MPTCP_MIB_ADDADDRRX);
 }
@@ -2363,6 +2382,19 @@ int mptcp_rcv_synsent_state_process(struct sock *sk, struct sock **skptr,
 		sk_set_socket(sk, mptcp_meta_sk(sk)->sk_socket);
 		sk->sk_wq = mptcp_meta_sk(sk)->sk_wq;
 
+		if (mopt->saw_nojoin) {
+			const struct iphdr *iph = ip_hdr(skb);
+			
+			if (is_master_tp(tp) && tp->mpcb->pm_ops->ban_raddr) {
+				if (iph->version == 4)
+					tp->mpcb->pm_ops->ban_raddr(sk,AF_INET,(const union inet_addr *) &iph->saddr);
+				else
+					tp->mpcb->pm_ops->ban_raddr(sk,AF_INET6,(const union inet_addr *) &iph->saddr);
+
+				mptcp_debug("%s: ban received for the IP addr src_addr:%pI4\n", __func__ , &iph->saddr);
+
+			}
+		}
 		 /* hold in sk_clone_lock due to initialization to 2 */
 		sock_put(sk);
 	} else {
